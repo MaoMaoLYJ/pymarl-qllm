@@ -1,0 +1,82 @@
+TASK PROMPT: SMAC 2C_VS_64ZG MAP CREDIT ASSIGNMENT GENERATION
+
+SECTION 1: CONTEXT AND OBJECTIVE
+You are an expert in Multi-Agent Reinforcement Learning (MARL), specifically focusing on the QLLM framework.
+Your task is to generate a PyTorch function named QLLMNetwork(agents_q, state).
+This function must act as a non-linear mixing network that takes individual agent Q-values (agents_q, shape [Batch, 2]) and the global state (state, shape [Batch, 342]) to compute a scalar Global Q-value (shape [Batch, 1]).
+Crucial: You must utilize the detailed features in the state vector (defined below) to dynamically compute weights and biases for summing the agent Q-values, rather than just simply summing them up.
+The agents receive rewards consisting of damage rewards, kill rewards, and a win bonus:
+
+Damage Reward: +1 reward for each point of damage dealt to the health or shield of any enemy unit.
+
+Kill Reward: +10 reward for each enemy unit defeated.
+
+Win Reward: +200 reward when all 64 enemy units are defeated.
+The episodic return is scaled: scaled_return = episodic_return * (20 / max_return). The maximum possible scaled return is 20.
+
+The action space is discrete with 70 actions:
+0: No-Op (dead only)
+1: Stop
+2: Move North
+3: Move South
+4: Move East
+5: Move West
+6-69: Attack Enemy 1-64
+Agents must wait for a cooldown period after attacking.
+
+SECTION 2: ENVIRONMENT SPECIFICATION (STARCRAFT II - 2C_VS_64ZG)
+Scenario Name: 2c_vs_64zg (2 Colossi vs 64 Zerglings)
+Map Dimensions: 32 x 32
+Unit Type: Colossus (Protoss Agents) and Zergling (Zerg Enemies)
+UNIT STATS:
+Colossus (Allies): Max Health: 200.0, Max Shield: 150.0, Normalized Attack Range: 0.25 (7.0 distance). Colossi deal splash damage.
+Zergling (Enemies): Max Health: 35.0, Max Shield: 0.0, Normalized Attack Range: Melee (Approx. 0.01)
+NORMALIZATION LOGIC IN STATE VECTOR:
+Health and Shield are normalized to [0, 1] calculated as: current_value / max_value
+Coordinates (X, Y) are normalized absolute coordinates relative to the map center.
+Coordinate Range: [-0.5, 0.5]
+Coordinate Formula: (absolute_coord - map_center) / 28
+
+SECTION 2.5: HEURISTIC REASONING GUIDE (For Weight Calculation)
+Mask Dead Agent: If an agent's normalized health (Feature [0]) is 0.0, its weight in the mixing network MUST be forced to 0.0 using torch.where or a mask to prevent dead agents from contributing to the Global Q-value.
+Splash Damage Strategy: Colossi deal powerful splash damage. Success depends on maintaining distance from the massive swarm of Zerglings. Credit should be weighted toward agents that are effectively engaging clusters of enemies while kiting.
+Role-Based Threat: Colossi (Agent 1-2) are at high risk if Zerglings surround them. Because Zerglings are melee, proximity is the primary threat. An agent being swarmed (multiple enemies at very close distance) should have its survival actions prioritized via higher weights.
+Shield Awareness: Feature [4] is the Colossus's Shield. Colossi rely on their massive shields. If shields are low or 0.0, the agent is in immediate danger. Weights should reflect the combined Health and Shield as the core survivability metric.
+Efficiency & Cooldown: Feature [1] is the Weapon Cooldown. Since Colossi have a slow attack speed, an agent with Cooldown == 0 is ready to deliver a massive splash hit and should be weighted higher than an agent currently on cooldown.
+Swarm Management: With 64 enemies, the agents must manage the crowd. If one agent is drawing the majority of the "aggro" (enemies are closer to it), its positioning and survival Q-values are more significant to the team's continued success.
+
+SECTION 3: DATA STRUCTURE - GLOBAL STATE (342 DIMENSIONS)
+The input 'state' tensor has a shape of (batch_size, 342). It contains absolute information about the entire battlefield. You must slice it accurately using the indices below.
+
+PART A: ALLY INFORMATION (INDICES 0 - 9)
+Contains data for 2 agents (Colossi). Each agent has 5 features.
+Layout order: Agent 1, Agent 2
+Feature Structure:
+[0] Health (0.0 to 1.0)
+[1] Weapon Cooldown (0.0 means ready, >0 means cooling down)
+[2] Relative X Coordinate (-0.5 to 0.5)
+[3] Relative Y Coordinate (-0.5 to 0.5)
+[4] Shield (0.0 to 1.0)
+Slicing Guide:
+Agent 1: state[:, 0:5]
+Agent 2: state[:, 5:10]
+
+PART B: ENEMY INFORMATION (INDICES 10 - 201)
+Contains data for 64 enemy Zerglings. Each enemy has 3 features.
+Feature Count per Enemy: 3
+Feature Structure:
+[0] Health (0.0 to 1.0)
+[1] Relative X Coordinate (-0.5 to 0.5)
+[2] Relative Y Coordinate (-0.5 to 0.5)
+Slicing Guide:
+Enemy 1: state[:, 10:13] ... Enemy 64: state[:, 199:202]
+
+PART C: LAST ACTIONS (INDICES 202 - 341)
+2 agents, 70-dim one-hot actions each.
+Action Encoding: 0:No-op, 1:Stop, 2-5:Move(N,S,E,W), 6-69:Attack Enemy 1-64.
+Total Dimensions: 140 (2 agents * 70 actions)
+Slicing Guide:
+Agent 1 Action: state[:, 202:272]
+Agent 2 Action: state[:, 272:342]
+
+Please write the QLLMNetwork function in PyTorch, ensuring all tensors are on state.device.

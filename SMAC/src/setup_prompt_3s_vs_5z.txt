@@ -1,0 +1,87 @@
+TASK PROMPT: SMAC 3S_VS_5Z MAP CREDIT ASSIGNMENT GENERATION
+
+SECTION 1: CONTEXT AND OBJECTIVE
+You are an expert in Multi-Agent Reinforcement Learning (MARL), specifically focusing on the QLLM framework.
+Your task is to generate a PyTorch function named QLLMNetwork(agents_q, state).
+This function must act as a non-linear mixing network that takes individual agent Q-values (agents_q, shape [Batch, 3]) and the global state (state, shape [Batch, 68]) to compute a scalar Global Q-value (shape [Batch, 1]).
+Crucial: You must utilize the detailed features in the state vector (defined below) to dynamically compute weights and biases for summing the agent Q-values, rather than just simply summing them up.
+The agents receive rewards consisting of damage rewards, kill rewards, and a win bonus:
+
+1.Damage Reward: +1 reward for each point of damage dealt to the health or shield of any enemy unit.
+2.Kill Reward: +10 reward for each enemy unit defeated.
+3.Win Reward: +200 reward when all five enemy units are defeated.
+The episodic return is scaled: scaled_return = episodic_return * (20 / max_return). The maximum possible scaled return is 20.
+
+The action space is discrete with 11 actions:
+0: No-Op (dead only)
+1: Stop
+2: Move North
+3: Move South
+4: Move East
+5: Move West
+6: Attack Enemy 1
+7: Attack Enemy 2
+8: Attack Enemy 3
+9: Attack Enemy 4
+10: Attack Enemy 5
+Agents must wait for a cooldown period after attacking.
+
+SECTION 2: ENVIRONMENT SPECIFICATION (STARCRAFT II - 3S_VS_5Z)
+Scenario Name: 3s_vs_5z (3 Stalkers vs 5 Zealots)
+Map Dimensions: 32 x 32
+Unit Type: Stalker (Protoss Agents) and Zealot (Protoss Enemies)
+UNIT STATS:
+Stalker (Allies): Max Health: 80.0, Max Shield: 80.0, Normalized Attack Range: 0.2142 (6.0 distance)
+Zealot (Enemies): Max Health: 100.0, Max Shield: 50.0, Normalized Attack Range: Melee (Approx. 0.05)
+NORMALIZATION LOGIC IN STATE VECTOR:
+Health and Shield are normalized to [0, 1] calculated as: current_value / max_value
+Coordinates (X, Y) are normalized absolute coordinates relative to the map center.
+Coordinate Range: [-0.5, 0.5]
+Coordinate Formula: (absolute_coord - map_center) / 28
+
+SECTION 2.5: HEURISTIC REASONING GUIDE (For Weight Calculation)
+Mask Dead Agent: If an agent's normalized health (Feature [0]) is 0.0, its weight in the mixing network MUST be forced to 0.0 using torch.where or a mask to prevent dead agents from contributing to the Global Q-value.
+Kiting Strategy: Stalkers are ranged units facing 5 melee Zealots. Success depends on "kiting"—maintaining a distance greater than 0.05 but less than 0.2142. Agents successfully maintaining this distance while attacking should receive higher credit weights.
+Role-Based Threat: Stalkers (Agent 1-3) are at extreme risk if any Zealot gets within melee range (< 0.05). If an agent is cornered or surrounded, its survival actions (movement/retreat) are critical, and its weight should be increased.
+Shield Awareness: Feature [4] is the Stalker's Shield. Stalkers should cycle aggression to allow shields to regenerate. An agent with 0.0 Shield is in a critical state; prioritize its credit for kiting/survival.
+Efficiency & Cooldown: Feature [1] is the Weapon Cooldown. Agents ready to fire (Cooldown == 0) are more valuable for the current team reward than those on cooldown.
+Focus Fire: If multiple Stalkers target the same Zealot (especially a low-health one), increase the weights for those agents to encourage coordination and rapid eliminations.
+
+SECTION 3: DATA STRUCTURE - GLOBAL STATE (68 DIMENSIONS)
+The input 'state' tensor has a shape of (batch_size, 68). It contains absolute information about the entire battlefield. You must slice it accurately using the indices below.
+
+PART A: ALLY INFORMATION (INDICES 0 - 14)
+Contains data for 3 agents (Stalkers). Each agent has 5 features.
+Layout order: Agent 1 (Stalker), Agent 2 (Stalker), Agent 3 (Stalker)
+Feature Structure:
+[0] Health (0.0 to 1.0)
+[1] Weapon Cooldown (0.0 means ready, >0 means cooling down)
+[2] Relative X Coordinate (-0.5 to 0.5)
+[3] Relative Y Coordinate (-0.5 to 0.5)
+[4] Shield (0.0 to 1.0)
+Slicing Guide:
+Agent 1: state[:, 0:5]
+Agent 2: state[:, 5:10]
+Agent 3: state[:, 10:15]
+
+PART B: ENEMY INFORMATION (INDICES 15 - 34)
+Contains data for 5 enemy units (Zealots). Each enemy has 4 features.
+Layout order: Enemy 1, Enemy 2, Enemy 3, Enemy 4, Enemy 5
+Feature Structure:
+[0] Health (0.0 to 1.0)
+[1] Relative X Coordinate (-0.5 to 0.5)
+[2] Relative Y Coordinate (-0.5 to 0.5)
+[3] Shield (0.0 to 1.0)
+Slicing Guide:
+Enemy 1: state[:, 15:19], Enemy 2: state[:, 19:23], Enemy 3: state[:, 23:27], Enemy 4: state[:, 27:31], Enemy 5: state[:, 31:35]
+
+PART C: LAST ACTIONS (INDICES 35 - 67)
+3 agents, 11-dim one-hot actions each.
+Action Encoding: 0:No-op, 1:Stop, 2-5:Move(N,S,E,W), 6-10:Attack Enemy 1-5.
+Total Dimensions: 33 (3 agents * 11 actions)
+Slicing Guide:
+Agent 1 Action: state[:, 35:46]
+Agent 2 Action: state[:, 46:57]
+Agent 3 Action: state[:, 57:68]
+
+Please write the QLLMNetwork function in PyTorch, ensuring all tensors are on state.device.

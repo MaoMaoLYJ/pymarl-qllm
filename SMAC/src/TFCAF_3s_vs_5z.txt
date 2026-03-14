@@ -1,0 +1,219 @@
+import torch
+import torch.nn.functional as F
+
+def QLLMNetwork(agents_q: torch.Tensor, global_state: torch.Tensor) -> torch.Tensor:
+    device = global_state.device
+    batch_size = global_state.shape[0]
+    n_agents = 3
+    n_enemies = 5
+    
+    # Extract ally features for each agent
+    ally_features = []
+    for i in range(n_agents):
+        start_idx = i * 5
+        features = global_state[:, start_idx:start_idx+5]  # [health, cooldown, x, y, shield]
+        ally_features.append(features)
+    
+    ally_tensor = torch.stack(ally_features, dim=1)  # [batch, 3, 5]
+    
+    # Extract enemy features
+    enemy_features = []
+    for i in range(n_enemies):
+        start_idx = 15 + i * 4
+        features = global_state[:, start_idx:start_idx+4]  # [health, x, y, shield]
+        enemy_features.append(features)
+    
+    enemy_tensor = torch.stack(enemy_features, dim=1)  # [batch, 5, 4]
+    
+    # Extract last actions for each agent
+    action_features = []
+    for i in range(n_agents):
+        start_idx = 35 + i * 11
+        actions = global_state[:, start_idx:start_idx+11]
+        action_features.append(actions)
+    
+    action_tensor = torch.stack(action_features, dim=1)  # [batch, 3, 11]
+    
+    # Initialize weight components
+    weight_components = torch.zeros((batch_size, n_agents), device=device)
+    
+    # Component 1: Health mask (dead agents get zero weight)
+    health = ally_tensor[:, :, 0]  # [batch, 3]
+    health_mask = (health > 0).float()
+    
+    # Component 2: Cooldown readiness with adjusted scaling
+    cooldown = ally_tensor[:, :, 1]  # [batch, 3]
+    cooldown_readiness = 1.0 / (1.0 + torch.exp(5.0 * (cooldown - 0.3)))
+    
+    # Component 3: Shield awareness with piecewise scaling
+    shield = ally_tensor[:, :, 4]  # [batch, 3]
+    # Critical when shield < 0.3, normal otherwise
+    shield_factor = torch.where(
+        shield < 0.3, 2.0 - shield * 3.0,
+        1.5 - shield * 0.8
+    )
+    shield_factor = torch.clamp(shield_factor, 0.5, 2.0)
+    
+    # Component 4: Kiting effectiveness with enhanced calculations
+    ally_pos = ally_tensor[:, :, 2:4]  # [batch, 3, 2]
+    enemy_pos = enemy_tensor[:, :, 1:3]  # [batch, 5, 2]
+    
+    # Calculate distances between all allies and enemies
+    ally_pos_expanded = ally_pos.unsqueeze(2)  # [batch, 3, 1, 2]
+    enemy_pos_expanded = enemy_pos.unsqueeze(1)  # [batch, 1, 5, 2]
+    distances = torch.norm(ally_pos_expanded - enemy_pos_expanded, dim=3)  # [batch, 3, 5]
+    
+    # Find minimum distance to any enemy for each agent
+    min_distances, _ = torch.min(distances, dim=2)  # [batch, 3]
+    
+    # Enhanced kiting score with smooth transitions
+    kiting_lower = 0.05
+    kiting_optimal_lower = 0.08
+    kiting_optimal_upper = 0.15
+    kiting_upper = 0.2142
+    
+    # Calculate smooth kiting score using Gaussian-like functions
+    optimal_center = (kiting_optimal_lower + kiting_optimal_upper) / 2
+    optimal_width = (kiting_optimal_upper - kiting_optimal_lower) / 2
+    
+    # Gaussian function for optimal zone
+    optimal_score = torch.exp(-((min_distances - optimal_center) ** 2) / (2 * (optimal_width ** 2))) * 2.0
+    
+    # Penalize being too close (danger zone)
+    danger_penalty = torch.sigmoid((kiting_lower - min_distances) * 30.0) * 1.5
+    
+    # Penalize being too far
+    far_penalty = torch.sigmoid((min_distances - kiting_upper) * 20.0) * 0.8
+    
+    kiting_score = optimal_score - danger_penalty - far_penalty + 0.5
+    
+    # Component 5: Enhanced focus fire with leader emphasis
+    attack_actions = action_tensor[:, :, 6:11]  # [batch, 3, 5]
+    attack_targets = torch.argmax(attack_actions, dim=2)  # [batch, 3]
+    
+    # Create binary mask for agents actually attacking
+    is_attacking = (torch.argmax(action_tensor, dim=2) >= 6) & (torch.argmax(action_tensor, dim=2) <= 10)
+    is_attacking_float = is_attacking.float()
+    
+    # Calculate coordination with leader emphasis (agent 0 as primary)
+    enemy_health = enemy_tensor[:, :, 0]  # [batch, 5]
+    agent_enemy_health = torch.zeros((batch_size, n_agents), device=device)
+    
+    # Get health of targeted enemy for each attacking agent
+    for i in range(n_agents):
+        batch_indices = torch.arange(batch_size, device=device)
+        enemy_indices = attack_targets[:, i]
+        agent_enemy_health[:, i] = enemy_health[batch_indices, enemy_indices]
+    
+    # Base focus score with enemy health consideration
+    focus_score_base = (1.0 - agent_enemy_health) * 1.8
+    
+    # Enhanced coordination with leader emphasis
+    coordination_matrix = torch.zeros((batch_size, n_agents, n_agents), device=device)
+    for i in range(n_agents):
+        for j in range(n_agents):
+            if i != j:
+                same_target = (attack_targets[:, i] == attack_targets[:, j]).float()
+                coordination_matrix[:, i, j] = same_target * is_attacking_float[:, j]
+    
+    # Sum coordination from other agents
+    coordination_from_others = coordination_matrix.sum(dim=2)  # [batch, 3]
+    
+    # Apply leader emphasis: agent 0 gets coordination bonus from all agents
+    # agent 1 and 2 get coordination bonus but with reduced impact
+    leader_coordination = coordination_from_others.clone()
+    leader_coordination[:, 0] *= 1.3  # Leader gets extra coordination weight
+    leader_coordination[:, 1] *= 0.9  # Reduced for agent 1
+    leader_coordination[:, 2] *= 0.9  # Reduced for agent 2
+    
+    coordination_bonus = 1.0 + leader_coordination * 0.4
+    
+    focus_score = focus_score_base * coordination_bonus * is_attacking_float
+    
+    # Component 6: Threat assessment with agent-specific handling
+    # Calculate threat level from each enemy to each agent
+    threat_level = 1.0 / (distances + 0.1)  # [batch, 3, 5]
+    
+    # Weight threat by enemy health and shield
+    enemy_combined_health = enemy_tensor[:, :, 0] + enemy_tensor[:, :, 3] * 0.5  # Health + 0.5*Shield
+    enemy_combined_health = enemy_combined_health.unsqueeze(1)  # [batch, 1, 5]
+    
+    weighted_threat = threat_level * (0.4 + enemy_combined_health * 0.6)  # [batch, 3, 5]
+    
+    # Sum threats from all enemies for each agent
+    total_threat = weighted_threat.sum(dim=2)  # [batch, 3]
+    
+    # Normalize threat to [0, 1] range with agent-specific adjustments
+    threat_max = total_threat.max(dim=1, keepdim=True)[0]
+    threat_min = total_threat.min(dim=1, keepdim=True)[0]
+    threat_range = threat_max - threat_min + 1e-8
+    normalized_threat = (total_threat - threat_min) / threat_range
+    
+    # Agent-specific threat handling: agent 0 gets higher weight for high threat
+    threat_weight = torch.ones_like(normalized_threat)
+    threat_weight[:, 0] = 0.7 + normalized_threat[:, 0] * 1.6  # Range [0.7, 2.3]
+    threat_weight[:, 1] = 0.6 + normalized_threat[:, 1] * 1.2  # Range [0.6, 1.8]
+    threat_weight[:, 2] = 0.6 + normalized_threat[:, 2] * 1.2  # Range [0.6, 1.8]
+    
+    # Component 7: Action evaluation with agent-specific considerations
+    action_indices = torch.argmax(action_tensor, dim=2)  # [batch, 3]
+    
+    # Evaluate actions based on agent role
+    action_scores = torch.zeros((batch_size, n_agents), device=device)
+    
+    # Leader (agent 0) gets bonus for attacking or strategic positioning
+    leader_attack_bonus = ((action_indices[:, 0] >= 6) & (action_indices[:, 0] <= 10)).float() * 0.8
+    leader_position_bonus = ((action_indices[:, 0] >= 2) & (action_indices[:, 0] <= 5)).float() * 0.4
+    action_scores[:, 0] = leader_attack_bonus + leader_position_bonus
+    
+    # Other agents get different bonuses
+    for i in range(1, n_agents):
+        # Supporting agents get bonus for coordinated attacks
+        coord_attack_bonus = ((action_indices[:, i] >= 6) & (action_indices[:, i] <= 10)).float() * 0.6
+        # Survival actions when in danger
+        in_danger = (min_distances[:, i] < 0.08).float()
+        survival_bonus = ((action_indices[:, i] >= 1) & (action_indices[:, i] <= 5)).float() * in_danger * 0.5
+        action_scores[:, i] = coord_attack_bonus + survival_bonus
+    
+    # Component 8: Positional role with agent 0 as primary
+    # Calculate agent distances to map center
+    map_center = torch.zeros((batch_size, 1, 2), device=device)
+    agent_dist_to_center = torch.norm(ally_pos - map_center, dim=2)  # [batch, 3]
+    
+    # Agent 0 should be more central for coordination
+    central_role = torch.zeros((batch_size, n_agents), device=device)
+    central_role[:, 0] = 1.5 - agent_dist_to_center[:, 0] * 2.0  # Higher when closer to center
+    central_role[:, 1] = 1.0 - agent_dist_to_center[:, 1] * 1.0  # Moderate
+    central_role[:, 2] = 1.0 - agent_dist_to_center[:, 2] * 1.0  # Moderate
+    central_role = torch.clamp(central_role, 0.5, 1.5)
+    
+    # Combine all components with careful scaling
+    weight_components = (
+        health_mask * 1.3 +  # Base alive bonus
+        cooldown_readiness * 1.1 +  # Ready to fire bonus
+        shield_factor * 0.9 +  # Shield awareness
+        kiting_score * 1.4 +  # Positional safety
+        focus_score * 1.2 +  # Coordination with leader emphasis
+        threat_weight * 0.7 +  # Threat assessment with agent-specific handling
+        action_scores * 0.5 +  # Action evaluation
+        central_role * 0.4  # Positional role
+    )
+    
+    # Apply tanh to constrain magnitude before softmax
+    constrained_components = torch.tanh(weight_components / 3.0) * 3.0
+    
+    # Apply softmax for weight distribution
+    weights = F.softmax(constrained_components, dim=1)
+    
+    # Ensure dead agents get zero weight
+    weights = weights * health_mask
+    
+    # Renormalize weights
+    weight_sum = weights.sum(dim=1, keepdim=True)
+    weight_sum = torch.where(weight_sum > 1e-8, weight_sum, torch.ones_like(weight_sum))
+    weights = weights / weight_sum
+    
+    # Compute global Q-value as weighted sum
+    global_q = (agents_q * weights).sum(dim=1, keepdim=True)
+    
+    return global_q

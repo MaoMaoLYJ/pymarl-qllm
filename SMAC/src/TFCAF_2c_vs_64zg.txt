@@ -1,0 +1,154 @@
+import torch
+
+def QLLMNetwork(agents_q: torch.Tensor, global_state: torch.Tensor) -> torch.Tensor:
+    batch_size = agents_q.shape[0]
+    n_agents = agents_q.shape[1]
+    
+    # Extract ally information (2 agents, 5 features each)
+    ally_features = torch.zeros(batch_size, n_agents, 5, device=agents_q.device)
+    for i in range(n_agents):
+        start_idx = i * 5
+        ally_features[:, i, 0] = global_state[:, start_idx + 0]  # Health
+        ally_features[:, i, 1] = global_state[:, start_idx + 1]  # Weapon Cooldown
+        ally_features[:, i, 2] = global_state[:, start_idx + 2]  # Relative X
+        ally_features[:, i, 3] = global_state[:, start_idx + 3]  # Relative Y
+        ally_features[:, i, 4] = global_state[:, start_idx + 4]  # Shield
+    
+    # Extract enemy information (64 enemies, 3 features each)
+    enemy_start = 10
+    enemy_features = global_state[:, enemy_start:enemy_start + 64*3].reshape(batch_size, 64, 3)
+    
+    # Calculate enemy pressure and team survivability for adaptive blending
+    alive_enemies = torch.sum(enemy_features[:, :, 0] > 0, dim=1, keepdim=True)
+    enemy_pressure = alive_enemies / 64.0
+    
+    team_health_shield = torch.sum(ally_features[:, :, 0] + ally_features[:, :, 4], dim=1, keepdim=True)
+    max_team_health_shield = 2 * (1.0 + 1.0)
+    survivability_ratio = team_health_shield / max_team_health_shield
+    
+    # Adaptive component blending
+    survival_blend = 0.35 + 0.25 * enemy_pressure + 0.2 * (1.0 - survivability_ratio)
+    readiness_blend = 0.25 + 0.1 * (1.0 - enemy_pressure)
+    tactical_blend = 0.25 + 0.2 * enemy_pressure
+    action_blend = 0.15 - 0.1 * enemy_pressure
+    
+    # Normalize blends to sum to 1
+    total_blend = survival_blend + readiness_blend + tactical_blend + action_blend
+    survival_blend = survival_blend / total_blend
+    readiness_blend = readiness_blend / total_blend
+    tactical_blend = tactical_blend / total_blend
+    action_blend = action_blend / total_blend
+    
+    # Component 1: Survival Weight with health-shield synergy
+    health_weight = ally_features[:, :, 0]
+    shield_weight = ally_features[:, :, 4]
+    health_shield_synergy = health_weight * (1.0 + 0.5 * shield_weight) + shield_weight * (0.3 + 0.7 * health_weight)
+    survival_weight = health_shield_synergy / (health_shield_synergy.max(dim=1, keepdim=True)[0] + 1e-6)
+    
+    # Component 2: Readiness Weight with attack priority
+    ready_mask = ally_features[:, :, 1] == 0.0
+    readiness_weight = torch.where(ready_mask, torch.ones_like(ready_mask, dtype=torch.float32), 
+                                   torch.sigmoid(3.0 - 8.0 * ally_features[:, :, 1]))
+    
+    # Component 3: Enhanced Tactical Positioning Weight
+    tactical_weight = torch.zeros(batch_size, n_agents, device=agents_q.device)
+    
+    for i in range(n_agents):
+        agent_coords = ally_features[:, i, 2:4].unsqueeze(1)
+        enemy_coords = enemy_features[:, :, 1:3]
+        enemy_health = enemy_features[:, :, 0]
+        
+        # Calculate distances to all enemies
+        distances = torch.sqrt(torch.sum((agent_coords - enemy_coords) ** 2, dim=2) + 1e-6)
+        
+        # Identify enemies in different ranges
+        in_attack_range = distances <= 0.25  # Colossus attack range
+        in_threat_range = distances <= 0.01   # Zergling melee threat range
+        enemy_alive = enemy_health > 0
+        
+        # Safe attack enemies: in attack range but not in threat range
+        safe_attack_enemies = in_attack_range & ~in_threat_range & enemy_alive
+        safe_attack_count = torch.sum(safe_attack_enemies, dim=1)
+        
+        # Threat enemies: in threat range
+        threat_enemies = in_threat_range & enemy_alive
+        threat_count = torch.sum(threat_enemies, dim=1)
+        
+        # Calculate enemy density around agent
+        density_radius = 0.15
+        in_density_radius = distances <= density_radius
+        enemy_density = torch.sum(in_density_radius & enemy_alive, dim=1) / 10.0  # Normalized
+        
+        # Adjust optimal distance based on survivability and enemy density
+        agent_survivability = (ally_features[:, i, 0] + ally_features[:, i, 4]) / 2.0
+        # Lower survivability -> increase optimal distance
+        base_optimal_dist = 0.12
+        optimal_dist_adjustment = (1.0 - agent_survivability) * 0.08  # Up to 0.08 adjustment
+        # Higher enemy density -> increase optimal distance
+        density_adjustment = enemy_density * 0.05  # Up to 0.05 adjustment
+        
+        optimal_dist = base_optimal_dist + optimal_dist_adjustment + density_adjustment
+        optimal_dist = torch.clamp(optimal_dist, 0.08, 0.20)
+        
+        # Calculate distance score for enemies in attack range
+        attack_distances = torch.where(in_attack_range & enemy_alive, distances, torch.ones_like(distances) * 100.0)
+        dist_scores = torch.exp(-torch.abs(attack_distances - optimal_dist.unsqueeze(1)) / 0.05)
+        # Only consider enemies in attack range
+        valid_scores = torch.where(in_attack_range & enemy_alive, dist_scores, torch.zeros_like(dist_scores))
+        mean_dist_score = torch.sum(valid_scores, dim=1) / (safe_attack_count + threat_count + 1e-6)
+        
+        # Calculate safe attack reward with diminishing returns
+        safe_attack_reward = safe_attack_count / (safe_attack_count + 3.0)
+        
+        # Threat penalty
+        threat_penalty = torch.exp(-threat_count / 2.0)
+        
+        # Combine components for tactical weight
+        tactical_weight[:, i] = (0.6 * safe_attack_reward + 0.4 * mean_dist_score) * threat_penalty
+    
+    # Normalize tactical weight
+    tactical_weight = tactical_weight / (tactical_weight.max(dim=1, keepdim=True)[0] + 1e-6)
+    
+    # Component 4: Action Efficiency Weight
+    action_start = 202
+    action_weights = torch.zeros(batch_size, n_agents, device=agents_q.device)
+    
+    for i in range(n_agents):
+        action_onehot = global_state[:, action_start + i*70: action_start + (i+1)*70]
+        
+        # Decode action type
+        was_attack = torch.sum(action_onehot[:, 6:70], dim=1) > 0.5
+        was_movement = torch.sum(action_onehot[:, 2:6], dim=1) > 0.5
+        
+        # Evaluate action efficiency based on context
+        attack_efficiency = torch.where(ready_mask[:, i], 0.8, 0.2)
+        movement_efficiency = 0.4 + 0.4 * torch.clamp(tactical_weight[:, i], 0.0, 1.0)
+        
+        action_weights[:, i] = (was_attack.float() * attack_efficiency + 
+                                was_movement.float() * movement_efficiency + 0.15)
+    
+    # Normalize action weights
+    action_weights = action_weights / (action_weights.max(dim=1, keepdim=True)[0] + 1e-6)
+    
+    # Combine weights with adaptive blending
+    combined_weights = (
+        survival_blend * survival_weight +
+        readiness_blend * readiness_weight +
+        tactical_blend * tactical_weight +
+        action_blend * action_weights
+    )
+    
+    # Mask dead and critically wounded agents
+    dead_mask = ally_features[:, :, 0] <= 0.0
+    critically_wounded = (ally_features[:, :, 0] + ally_features[:, :, 4]) < 0.15
+    combined_weights = torch.where(dead_mask | critically_wounded, 
+                                   torch.tensor(-1e8, device=agents_q.device), 
+                                   combined_weights)
+    
+    # Apply softmax for normalized weights
+    agent_weights = torch.softmax(combined_weights, dim=1)
+    
+    # Calculate global Q-value
+    global_q = torch.sum(agents_q * agent_weights, dim=1, keepdim=True)
+    
+    return global_q
